@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qaprobe"
+version = "0.1.0"
+description = "Agentic QA for web apps — local or deployed"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "playwright>=1.48.0",
+    "click>=8.1.0",
+    "pyyaml>=6.0",
+    "rich>=13.0.0",
+    "jinja2>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4.0"]
+
+[project.scripts]
+qaprobe = "qaprobe.cli:main"
+
+[project.urls]
+Homepage = "https://qaprobe.com"
+Repository = "https://github.com/hectorjassog/qaprobe"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qaprobe"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+# E501 is ignored in files with embedded HTML templates and LLM system prompts
+per-file-ignores = {"src/qaprobe/report.py" = ["E501"], "src/qaprobe/agent.py" = ["E501"], "src/qaprobe/verifier.py" = ["E501"]}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
