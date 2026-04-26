@@ -9,6 +9,22 @@ description = "Agentic QA for web apps — local or deployed"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"
+authors = [{name = "Hector Jasso", email = "hjassog@gmail.com"}]
+keywords = ["qa", "testing", "e2e", "accessibility", "a11y", "playwright", "anthropic", "claude", "agent", "browser-automation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Testing :: Acceptance",
+    "Environment :: Console",
+]
 dependencies = [
     "anthropic>=0.40.0",
     "playwright>=1.48.0",
@@ -19,7 +35,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4.0"]
+dev = ["pytest>=8.0", "ruff>=0.4.0", "build>=1.2.0", "twine>=5.0.0"]
 
 [project.scripts]
 qaprobe = "qaprobe.cli:main"
@@ -27,6 +43,8 @@ qaprobe = "qaprobe.cli:main"
 [project.urls]
 Homepage = "https://qaprobe.com"
 Repository = "https://github.com/hectorjassog/qaprobe"
+Issues = "https://github.com/hectorjassog/qaprobe/issues"
+Changelog = "https://github.com/hectorjassog/qaprobe/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qaprobe"]

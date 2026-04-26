@@ -33,4 +33,4 @@ async def save_storage_state(url: str, output_path: str) -> None:
 
 def load_storage_state(path: str) -> dict:
     """Load storage state from a JSON file."""
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_text(encoding="utf-8"))

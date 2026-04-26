@@ -95,7 +95,7 @@ def build_report(
 
 
 def save_report(report: RunReport, path: Path) -> None:
-    path.write_text(json.dumps(asdict(report), indent=2))
+    path.write_text(json.dumps(asdict(report), indent=2), encoding="utf-8")
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>

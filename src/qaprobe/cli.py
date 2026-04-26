@@ -124,7 +124,7 @@ async def _run_async(
         save_report(report, report_json_path)
 
         html_report = build_html_report(report)
-        (run_dir / "report.html").write_text(html_report)
+        (run_dir / "report.html").write_text(html_report, encoding="utf-8")
 
     finally:
         await session.close()
@@ -258,7 +258,7 @@ async def _suite_async(
                 artifacts=artifacts,
             )
             save_report(report, story_dir / "report.json")
-            (story_dir / "report.html").write_text(build_html_report(report))
+            (story_dir / "report.html").write_text(build_html_report(report), encoding="utf-8")
             verdict = report.verdict
         except Exception as e:
             console.print(f"  [red]Error: {e}[/red]")

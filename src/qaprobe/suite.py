@@ -24,7 +24,7 @@ class Suite:
 
 def load_suite(path: str | Path) -> Suite:
     """Load a YAML suite file."""
-    data = yaml.safe_load(Path(path).read_text())
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
     base_url = data.get("base_url", "")
     name = data.get("name", Path(path).stem)
