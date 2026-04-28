@@ -31,7 +31,14 @@ def test_agent_fail_verifier_pass():
 
 def test_timeout_verdict_is_fail():
     result = _agent("timeout")
-    # timeout is not "pass", so agent_pass = False
     assert reconcile_verdict(result, _verifier(False)) == "fail"
-    # If verifier says pass but agent timed out -> inconclusive
     assert reconcile_verdict(result, _verifier(True)) == "inconclusive"
+
+
+def test_low_confidence_pass_is_inconclusive():
+    """Confidence calibration: both pass but low confidence → inconclusive."""
+    assert reconcile_verdict(_agent("pass"), _verifier(True, confidence="low")) == "inconclusive"
+
+
+def test_medium_confidence_pass_is_pass():
+    assert reconcile_verdict(_agent("pass"), _verifier(True, confidence="medium")) == "pass"

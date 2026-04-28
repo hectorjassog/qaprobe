@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
-# Roles that map to short prefixes in refs
+from .config import DEBOUNCE_POLL_MS, DEBOUNCE_STABLE_MS, DEBOUNCE_TIMEOUT_MS
+
 ROLE_PREFIX = {
     "button": "btn",
     "link": "lnk",
@@ -67,6 +71,10 @@ ROLE_PREFIX = {
 }
 
 
+def _short_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:6]
+
+
 @dataclass
 class AXElement:
     ref: str
@@ -75,7 +83,8 @@ class AXElement:
     description: str = ""
     value: str = ""
     disabled: bool = False
-    level: int = 0  # for headings
+    level: int = 0
+    properties: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,13 +111,31 @@ class Snapshot:
 
 
 class RefResolver:
-    """Maps ref strings to Playwright locators."""
+    """Maps ref strings to Playwright locators with duplicate-name disambiguation."""
 
     def __init__(self) -> None:
         self._map: dict[str, AXElement] = {}
+        self._role_name_counts: dict[tuple[str, str], int] = {}
+        self._role_name_indices: dict[str, int] = {}
 
     def register(self, elements: list[AXElement]) -> None:
         self._map = {el.ref: el for el in elements}
+
+        counts: dict[tuple[str, str], int] = {}
+        indices: dict[str, int] = {}
+        seen: dict[tuple[str, str], int] = {}
+        for el in elements:
+            key = (el.role, el.name)
+            counts[key] = counts.get(key, 0) + 1
+
+        for el in elements:
+            key = (el.role, el.name)
+            idx = seen.get(key, 0)
+            seen[key] = idx + 1
+            indices[el.ref] = idx
+
+        self._role_name_counts = counts
+        self._role_name_indices = indices
 
     def resolve(self, page: Page, ref: str) -> Any:
         """Return a Playwright locator for the given ref."""
@@ -116,67 +143,107 @@ class RefResolver:
         if el is None:
             raise ValueError(f"Unknown ref: {ref!r}")
 
-        # Parse the index from the ref (e.g., "btn:3" → index 3)
-        parts = ref.rsplit(":", 1)
-        idx = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 0
-
         role = el.role
         name = el.name
+        idx = self._role_name_indices.get(ref, 0)
 
         if name:
             locator = page.get_by_role(role, name=name)  # type: ignore[arg-type]
-            return locator.nth(0)
+            return locator.nth(idx)
         else:
             return page.get_by_role(role).nth(idx)  # type: ignore[arg-type]
 
 
-def _ax_node_to_element(node: dict, counters: dict[str, int]) -> AXElement | None:
-    role = node.get("role", {}).get("value", "")
-    if not role or role in ("none", "presentation", "ignored", "InlineTextBox", "StaticText"):
-        return None
+def _build_parent_map(nodes: list[dict]) -> dict[str, str]:
+    """Build nodeId → parentId lookup from CDP nodes that have parentId."""
+    parent_map: dict[str, str] = {}
+    for node in nodes:
+        nid = node.get("nodeId", "")
+        pid = node.get("parentId")
+        if nid and pid:
+            parent_map[nid] = pid
+    return parent_map
 
-    name_val = node.get("name", {}).get("value", "")
-    desc_val = node.get("description", {}).get("value", "")
-    value_val = node.get("value", {}).get("value", "")
 
-    # Check if hidden
-    properties = {p["name"]: p.get("value", {}).get("value") for p in node.get("properties", [])}
-    if properties.get("hidden") is True:
-        return None
+def _build_node_map(nodes: list[dict]) -> dict[str, dict]:
+    return {node["nodeId"]: node for node in nodes if "nodeId" in node}
 
+
+def _get_parent_role(node_map: dict[str, dict], parent_map: dict[str, str], node_id: str) -> str:
+    pid = parent_map.get(node_id)
+    if not pid:
+        return ""
+    parent = node_map.get(pid)
+    if not parent:
+        return ""
+    return parent.get("role", {}).get("value", "")
+
+
+def _make_stable_ref(role: str, name: str, parent_role: str, counters: dict[str, int]) -> str:
     prefix = ROLE_PREFIX.get(role, role[:3].lower())
-    idx = counters.get(prefix, 0)
-    counters[prefix] = idx + 1
-    ref = f"{prefix}:{idx}"
+    if name:
+        safe_name = name.lower().replace(" ", "-")[:20]
+        base = f"{prefix}:{safe_name}"
+        if parent_role:
+            parent_prefix = ROLE_PREFIX.get(parent_role, parent_role[:3].lower())
+            base = f"{prefix}:{safe_name}@{parent_prefix}"
+    else:
+        base = prefix
 
-    level = 0
-    if role == "heading":
-        try:
-            level = int(properties.get("level", 0) or 0)
-        except (ValueError, TypeError):
-            level = 0
-
-    disabled = bool(properties.get("disabled"))
-
-    return AXElement(
-        ref=ref,
-        role=role,
-        name=name_val,
-        description=desc_val,
-        value=str(value_val) if value_val is not None else "",
-        disabled=disabled,
-        level=level,
-    )
+    count = counters.get(base, 0)
+    counters[base] = count + 1
+    if count == 0:
+        return base
+    return f"{base}#{count}"
 
 
 def parse_ax_tree(nodes: list[dict]) -> Snapshot:
-    """Convert raw CDP AX nodes to a Snapshot."""
+    """Convert raw CDP AX nodes to a Snapshot with stable deterministic refs."""
+    parent_map = _build_parent_map(nodes)
+    node_map = _build_node_map(nodes)
     counters: dict[str, int] = {}
     elements = []
+
     for node in nodes:
-        el = _ax_node_to_element(node, counters)
-        if el is not None:
-            elements.append(el)
+        role = node.get("role", {}).get("value", "")
+        if not role or role in ("none", "presentation", "ignored", "InlineTextBox", "StaticText"):
+            continue
+
+        name_val = node.get("name", {}).get("value", "")
+        desc_val = node.get("description", {}).get("value", "")
+        value_val = node.get("value", {}).get("value", "")
+
+        props = {p["name"]: p.get("value", {}).get("value") for p in node.get("properties", [])}
+        if props.get("hidden") is True:
+            continue
+
+        node_id = node.get("nodeId", "")
+        parent_role = _get_parent_role(node_map, parent_map, node_id)
+
+        ref = _make_stable_ref(role, name_val, parent_role, counters)
+
+        level = 0
+        if role == "heading":
+            try:
+                level = int(props.get("level", 0) or 0)
+            except (ValueError, TypeError):
+                level = 0
+
+        disabled = bool(props.get("disabled"))
+
+        elements.append(
+            AXElement(
+                ref=ref,
+                role=role,
+                name=name_val,
+                description=desc_val,
+                value=str(value_val) if value_val is not None else "",
+                disabled=disabled,
+                level=level,
+                properties=props,
+            )
+        )
+
     snapshot = Snapshot(elements=elements)
     snapshot.raw_text = snapshot.compact()
     return snapshot
@@ -195,7 +262,6 @@ class BrowserSession:
         self.resolver = RefResolver()
 
     async def start(self, runs_dir: str, storage_state: str | None = None) -> Page:
-
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(headless=self.headless)
 
@@ -224,6 +290,47 @@ class BrowserSession:
         snap = parse_ax_tree(nodes)
         self.resolver.register(snap.elements)
         return snap
+
+    async def wait_for_stable(self) -> None:
+        """Wait until the AX tree stabilizes (SPA debouncing)."""
+        page = self._page
+        assert page is not None
+
+        poll_interval = DEBOUNCE_POLL_MS / 1000
+        stable_threshold = DEBOUNCE_STABLE_MS / 1000
+        timeout = DEBOUNCE_TIMEOUT_MS / 1000
+
+        client = await page.context.new_cdp_session(page)
+        result = await client.send("Accessibility.getFullAXTree")
+        last_count = len(result.get("nodes", []))
+        await client.detach()
+
+        stable_time = 0.0
+        elapsed = 0.0
+
+        while elapsed < timeout:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            client = await page.context.new_cdp_session(page)
+            result = await client.send("Accessibility.getFullAXTree")
+            current_count = len(result.get("nodes", []))
+            await client.detach()
+
+            if current_count == last_count:
+                stable_time += poll_interval
+                if stable_time >= stable_threshold:
+                    return
+            else:
+                stable_time = 0.0
+                last_count = current_count
+
+    async def screenshot(self) -> str:
+        """Take a screenshot and return it as a base64-encoded PNG."""
+        page = self._page
+        assert page is not None
+        png_bytes = await page.screenshot(type="png", full_page=False)
+        return base64.b64encode(png_bytes).decode("ascii")
 
     async def save_trace(self, path: str) -> None:
         assert self._context is not None

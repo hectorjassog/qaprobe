@@ -5,8 +5,7 @@ from qaprobe.browser import AXElement, Snapshot
 
 
 def _snap(*elements):
-    s = Snapshot(elements=list(elements))
-    return s
+    return Snapshot(elements=list(elements))
 
 
 def test_no_findings_on_clean_page():
@@ -28,8 +27,7 @@ def test_unlabeled_button():
 def test_unlabeled_input():
     snap = _snap(AXElement(ref="inp:0", role="textbox", name=""))
     findings = audit_snapshot(snap)
-    assert len(findings) == 1
-    assert findings[0].type == "missing_label"
+    assert any(f.type == "missing_label" for f in findings)
 
 
 def test_missing_alt():
@@ -42,7 +40,7 @@ def test_missing_alt():
 def test_heading_skip():
     snap = _snap(
         AXElement(ref="hd:0", role="heading", name="Title", level=1),
-        AXElement(ref="hd:1", role="heading", name="Section", level=3),  # skips h2
+        AXElement(ref="hd:1", role="heading", name="Section", level=3),
     )
     findings = audit_snapshot(snap)
     assert any(f.type == "heading_skip" for f in findings)
@@ -63,3 +61,33 @@ def test_unlabeled_link():
     findings = audit_snapshot(snap)
     assert len(findings) == 1
     assert findings[0].type == "unlabeled_link"
+
+
+def test_live_region_with_empty_name():
+    snap = _snap(AXElement(ref="stat:0", role="status", name="", properties={"live": "polite"}))
+    findings = audit_snapshot(snap)
+    assert any(f.type == "empty_live_region" for f in findings)
+
+
+def test_positive_tabindex():
+    snap = _snap(
+        AXElement(ref="btn:0", role="button", name="Skip", properties={"tabindex": 5})
+    )
+    findings = audit_snapshot(snap)
+    assert any(f.type == "positive_tabindex" for f in findings)
+
+
+def test_no_label_association():
+    snap = _snap(
+        AXElement(ref="chk:0", role="checkbox", name="", properties={})
+    )
+    findings = audit_snapshot(snap)
+    assert any(f.type == "no_label_association" for f in findings)
+
+
+def test_label_association_ok_with_labelled_by():
+    snap = _snap(
+        AXElement(ref="chk:0", role="checkbox", name="", properties={"labelledby": "label-1"})
+    )
+    findings = audit_snapshot(snap)
+    assert not any(f.type == "no_label_association" for f in findings)

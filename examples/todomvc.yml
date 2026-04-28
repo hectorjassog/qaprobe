@@ -1,0 +1,17 @@
+# QAProbe example suite — tests against TodoMVC (public demo)
+name: todomvc
+base_url: https://todomvc.com/examples/react/dist
+
+stories:
+  - name: add_todo
+    path: /
+    story: "Type 'Buy groceries' into the todo input and press Enter, then verify the item appears in the list"
+
+  - name: complete_todo
+    path: /
+    story: "Add a todo item, then click its checkbox to mark it complete, and verify it shows as completed"
+
+  - name: filter_completed
+    path: /
+    story: "Add two todos, complete one, click the 'Completed' filter, and verify only the completed item is shown"
+    depends_on: complete_todo

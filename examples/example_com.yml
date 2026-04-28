@@ -1,0 +1,13 @@
+# QAProbe example suite — tests against example.com (always available)
+name: example-com
+base_url: https://example.com
+
+stories:
+  - name: page_loads
+    path: /
+    story: "Verify the page loads and contains an 'Example Domain' heading"
+
+  - name: more_info_link
+    path: /
+    story: "Click the 'More information...' link and verify navigation to IANA's site"
+    depends_on: page_loads

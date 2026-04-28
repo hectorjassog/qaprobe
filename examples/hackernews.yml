@@ -1,0 +1,18 @@
+# QAProbe example suite — tests against Hacker News (public site)
+name: hackernews
+base_url: https://news.ycombinator.com
+
+stories:
+  - name: front_page_loads
+    path: /
+    story: "Verify the front page loads with at least 10 story links visible"
+
+  - name: navigate_to_new
+    path: /
+    story: "Click the 'new' link in the navigation and verify the page shows newer stories"
+    depends_on: front_page_loads
+
+  - name: story_comments
+    path: /
+    story: "Click the comments link on the first story and verify the comments page loads"
+    depends_on: front_page_loads

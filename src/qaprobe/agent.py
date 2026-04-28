@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
-import anthropic
 from playwright.async_api import Page
 
 from .browser import BrowserSession
-from .config import AGENT_MODEL, ANTHROPIC_API_KEY, MAX_STEPS
+from .config import AGENT_MODEL, FAST_MODEL, MAX_STEPS, ROUTING_THRESHOLD
+from .provider import LLMProvider, get_provider
 
 AGENT_SYSTEM = """You are QAProbe, an expert QA engineer driving a browser to test a web application.
 
@@ -20,7 +21,7 @@ Continue until you have enough information to determine if the story passes or f
 
 Rules:
 - Only interact with elements that exist in the accessibility tree
-- Use refs (like btn:0, inp:1) to identify elements
+- Use refs (like btn:submit@form, inp:email@form) to identify elements
 - Be methodical: observe, plan, act
 - When done, call `done` with your verdict (pass/fail) and clear reasoning
 - If the page doesn't load or you can't complete the story, call done with fail
@@ -35,7 +36,7 @@ TOOLS = [
             "properties": {
                 "ref": {
                     "type": "string",
-                    "description": "Element ref from the accessibility tree (e.g. btn:0)",
+                    "description": "Element ref from the accessibility tree (e.g. btn:submit@form)",
                 },
             },
             "required": ["ref"],
@@ -162,28 +163,53 @@ class AgentResult:
     final_snapshot: str = ""
 
 
+def _extract_origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def check_origin(target_url: str, allowed_origins: list[str]) -> None:
+    """Raise ValueError if target_url's origin is not in allowed_origins."""
+    if not allowed_origins:
+        return
+    target_origin = _extract_origin(target_url)
+    for origin in allowed_origins:
+        if target_origin == _extract_origin(origin):
+            return
+    raise ValueError(
+        f"Navigation to {target_url!r} blocked — origin {target_origin!r} "
+        f"not in allowed origins: {allowed_origins}"
+    )
+
+
 async def run_agent(
     page: Page,
     session: BrowserSession,
     story: str,
     url: str,
     max_steps: int = MAX_STEPS,
+    allowed_origins: list[str] | None = None,
+    model_routing: bool = True,
+    provider: LLMProvider | None = None,
 ) -> AgentResult:
     """Run the agent loop and return the result."""
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    llm = provider or get_provider()
 
-    # Navigate to starting URL
+    if allowed_origins is None:
+        allowed_origins = [url]
+
     await page.goto(url, wait_until="domcontentloaded")
+    await session.wait_for_stable()
 
     steps: list[Step] = []
     messages: list[dict] = []
+    last_step_ok = True
 
     for step_num in range(1, max_steps + 1):
-        # Take snapshot
         snap = await session.snapshot()
         snapshot_text = snap.compact()
+        element_count = len(snap.elements)
 
-        # Build user message with current page state
         user_content = (
             f"Step {step_num}/{max_steps}\n\n"
             f"Current page: {page.url}\n"
@@ -195,32 +221,29 @@ async def run_agent(
 
         messages.append({"role": "user", "content": user_content})
 
-        # Call the model
-        response = await client.messages.create(
-            model=AGENT_MODEL,
-            max_tokens=1024,
+        use_fast = (
+            model_routing
+            and element_count < ROUTING_THRESHOLD
+            and last_step_ok
+        )
+        model = FAST_MODEL if use_fast else AGENT_MODEL
+
+        response = await llm.chat(
+            model=model,
             system=AGENT_SYSTEM,
-            tools=TOOLS,  # type: ignore[arg-type]
-            messages=messages,  # type: ignore[arg-type]
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=1024,
+            cache_system=True,
         )
 
-        # Extract tool use
-        tool_use = None
-        for block in response.content:
-            if block.type == "tool_use":
-                tool_use = block
-                break
-
-        if tool_use is None:
-            # No tool called — treat as inconclusive step, continue
-            messages.append({
-                "role": "assistant",
-                "content": response.content,
-            })
+        if not response.tool_calls:
+            messages.append({"role": "assistant", "content": response.raw.content if hasattr(response.raw, "content") else response.text})
             continue
 
-        tool_name = tool_use.name
-        tool_input = tool_use.input
+        tool_call = response.tool_calls[0]
+        tool_name = tool_call.name
+        tool_input = tool_call.input
 
         step = Step(
             step_num=step_num,
@@ -229,7 +252,6 @@ async def run_agent(
             tool_input=tool_input,
         )
 
-        # Execute the tool
         if tool_name == "done":
             step.result = "done"
             steps.append(step)
@@ -243,32 +265,29 @@ async def run_agent(
         error = ""
         result_text = ""
         try:
-            result_text = await _execute_tool(page, session, tool_name, tool_input)
+            result_text = await _execute_tool(page, session, tool_name, tool_input, allowed_origins)
+            last_step_ok = True
         except Exception as e:
             error = str(e)
             result_text = f"Error: {error}"
+            last_step_ok = False
 
         step.result = result_text
         step.error = error
         steps.append(step)
 
-        # Add assistant response and tool result to messages
-        messages.append({
-            "role": "assistant",
-            "content": response.content,
-        })
+        messages.append({"role": "assistant", "content": response.raw.content if hasattr(response.raw, "content") else response.text})
         messages.append({
             "role": "user",
             "content": [
                 {
                     "type": "tool_result",
-                    "tool_use_id": tool_use.id,
+                    "tool_use_id": tool_call.id,
                     "content": result_text,
                 }
             ],
         })
 
-    # Step budget exhausted
     snap = await session.snapshot()
     return AgentResult(
         verdict="timeout",
@@ -283,6 +302,7 @@ async def _execute_tool(
     session: BrowserSession,
     tool_name: str,
     tool_input: dict[str, Any],
+    allowed_origins: list[str] | None = None,
 ) -> str:
     resolver = session.resolver
 
@@ -291,6 +311,7 @@ async def _execute_tool(
         locator = resolver.resolve(page, ref)
         await locator.click()
         await page.wait_for_load_state("domcontentloaded")
+        await session.wait_for_stable()
         return f"Clicked {ref}"
 
     elif tool_name == "fill":
@@ -305,6 +326,7 @@ async def _execute_tool(
         value = tool_input["value"]
         locator = resolver.resolve(page, ref)
         await locator.select_option(label=value)
+        await session.wait_for_stable()
         return f"Selected {value!r} in {ref}"
 
     elif tool_name == "press_key":
@@ -313,9 +335,11 @@ async def _execute_tool(
         return f"Pressed {key}"
 
     elif tool_name == "navigate":
-        url = tool_input["url"]
-        await page.goto(url, wait_until="domcontentloaded")
-        return f"Navigated to {url}"
+        target_url = tool_input["url"]
+        check_origin(target_url, allowed_origins or [])
+        await page.goto(target_url, wait_until="domcontentloaded")
+        await session.wait_for_stable()
+        return f"Navigated to {target_url}"
 
     elif tool_name == "scroll":
         direction = tool_input["direction"]

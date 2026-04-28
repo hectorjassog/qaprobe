@@ -1,0 +1,53 @@
+name: "QAProbe"
+description: "Run agentic QA tests against your web app"
+branding:
+  icon: "check-circle"
+  color: "purple"
+
+inputs:
+  suite:
+    description: "Path to the YAML suite file"
+    required: true
+  auth-state:
+    description: "Path to Playwright storage state JSON"
+    required: false
+    default: ""
+  python-version:
+    description: "Python version to use"
+    required: false
+    default: "3.11"
+  runs-dir:
+    description: "Directory to store run artifacts"
+    required: false
+    default: "runs"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install qaprobe
+      shell: bash
+      run: |
+        pip install qaprobe
+        playwright install chromium
+
+    - name: Run suite
+      shell: bash
+      run: |
+        ARGS="--runs-dir ${{ inputs.runs-dir }}"
+        if [ -n "${{ inputs.auth-state }}" ]; then
+          ARGS="$ARGS --auth ${{ inputs.auth-state }}"
+        fi
+        qaprobe suite ${{ inputs.suite }} $ARGS
+
+    - name: Upload artifacts on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: qaprobe-results
+        path: ${{ inputs.runs-dir }}/
+        retention-days: 14

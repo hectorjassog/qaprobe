@@ -90,4 +90,63 @@ def audit_snapshot(snapshot: Snapshot) -> list[A11yFinding]:
                 )
             last_heading_level = el.level
 
+        # Form fields with no associated label (via labelledBy property)
+        if el.role in ("textbox", "combobox", "spinbutton", "searchbox", "checkbox", "radio"):
+            labelled_by = el.properties.get("labelledby") or el.properties.get("labelledBy")
+            if not el.name and not labelled_by:
+                has_label_finding = any(
+                    f.element_ref == el.ref and f.type == "missing_label" for f in findings
+                )
+                if not has_label_finding:
+                    findings.append(
+                        A11yFinding(
+                            type="no_label_association",
+                            severity="error",
+                            element_ref=el.ref,
+                            element_role=el.role,
+                            element_name="",
+                            message=(
+                                f"Form field ({el.role}) has no label association — "
+                                "not programmatically linked to a label element"
+                            ),
+                        )
+                    )
+
+        # Live regions with empty names
+        if el.properties.get("live") and not el.name:
+            findings.append(
+                A11yFinding(
+                    type="empty_live_region",
+                    severity="warning",
+                    element_ref=el.ref,
+                    element_role=el.role,
+                    element_name="",
+                    message=(
+                        "Live region has no accessible name — "
+                        "updates may be announced without context"
+                    ),
+                )
+            )
+
+        # Positive tabindex (focus order issues)
+        tabindex = el.properties.get("tabindex")
+        if tabindex is not None:
+            try:
+                if int(tabindex) > 0:
+                    findings.append(
+                        A11yFinding(
+                            type="positive_tabindex",
+                            severity="warning",
+                            element_ref=el.ref,
+                            element_role=el.role,
+                            element_name=el.name,
+                            message=(
+                                f"Element has tabindex={tabindex} — "
+                                "positive tabindex disrupts natural focus order"
+                            ),
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
     return findings

@@ -4,16 +4,17 @@ import json
 import re
 from dataclasses import dataclass
 
-import anthropic
-
 from .agent import AgentResult
-from .config import ANTHROPIC_API_KEY, VERIFIER_MODEL
+from .config import VERIFIER_MODEL
+from .provider import LLMProvider, get_provider
 
 VERIFIER_SYSTEM = """You are an independent QA verifier. You will review the execution history of a browser automation agent and determine whether the user's story was successfully demonstrated.
 
 You must make an INDEPENDENT judgment based on the evidence — not just accept the agent's self-reported verdict.
 
 Be critical but fair. If there's ambiguity, report it."""
+
+SNAPSHOT_HISTORY_STEPS = 5
 
 
 @dataclass
@@ -26,11 +27,12 @@ class VerifierResult:
 async def run_verifier(
     story: str,
     agent_result: AgentResult,
+    screenshot_b64: str | None = None,
+    provider: LLMProvider | None = None,
 ) -> VerifierResult:
     """Run the independent verifier on the agent's result."""
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    llm = provider or get_provider()
 
-    # Build step history summary
     step_lines = []
     for step in agent_result.steps:
         step_lines.append(
@@ -38,27 +40,50 @@ async def run_verifier(
         )
     step_history = "\n".join(step_lines) if step_lines else "(no steps recorded)"
 
+    snapshot_history_parts = []
+    recent_steps = agent_result.steps[-SNAPSHOT_HISTORY_STEPS:]
+    for step in recent_steps:
+        truncated = "\n".join(step.snapshot.split("\n")[:50])
+        snapshot_history_parts.append(f"--- After step {step.step_num} ---\n{truncated}")
+    snapshot_history = "\n\n".join(snapshot_history_parts) if snapshot_history_parts else "(no snapshots)"
+
     prompt = (
         f"User story: {story}\n\n"
         f"Agent verdict: {agent_result.verdict}\n"
         f"Agent reasoning: {agent_result.reasoning}\n\n"
         f"Step history:\n{step_history}\n\n"
+        f"Snapshot history (last {SNAPSHOT_HISTORY_STEPS} steps):\n{snapshot_history}\n\n"
         f"Final page state (accessibility tree):\n{agent_result.final_snapshot}\n\n"
         f"Based on this evidence, did the agent successfully demonstrate the user story?\n\n"
         f"Respond with a JSON object:\n"
         f'{{\n  "goal_achieved": true/false,\n  "confidence": "high"/"medium"/"low",\n  "reasoning": "your independent assessment"\n}}'
     )
 
-    response = await client.messages.create(
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    if screenshot_b64:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": screenshot_b64,
+            },
+        })
+
+    messages = [{"role": "user", "content": content}]
+
+    response = await llm.chat(
         model=VERIFIER_MODEL,
-        max_tokens=1024,
         system=VERIFIER_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
+        max_tokens=1024,
     )
 
-    text = response.content[0].text if response.content else "{}"
+    text = response.text or "{}"
+    return _parse_verifier_response(text)
 
-    # Extract JSON from possible markdown code blocks
+
+def _parse_verifier_response(text: str) -> VerifierResult:
     json_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
     if json_match:
         try:
@@ -71,7 +96,6 @@ async def run_verifier(
         except json.JSONDecodeError:
             pass
 
-    # Fallback: try to parse the whole text
     try:
         data = json.loads(text)
         return VerifierResult(
