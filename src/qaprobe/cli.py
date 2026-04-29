@@ -508,33 +508,414 @@ def init() -> None:
 @main.command()
 @click.option("--url", required=True, help="URL to start recording from")
 @click.option("--append-to", default=None, help="Append generated story to a suite YAML file")
-def record(url: str, append_to: str | None) -> None:
-    """Record browser interactions and generate a user story."""
-    _check_api_key()
-    asyncio.run(_record_async(url, append_to))
+@click.option(
+    "--critical-path", "critical_path", is_flag=True, default=False,
+    help="Record as a deterministic critical path (role-based locators) instead of a story",
+)
+@click.option("--save-to", default=None, help="Save critical path to a YAML file")
+@click.option("--name", "path_name", default=None, help="Name for the critical path")
+def record(
+    url: str,
+    append_to: str | None,
+    critical_path: bool,
+    save_to: str | None,
+    path_name: str | None,
+) -> None:
+    """Record browser interactions and generate a user story or critical path."""
+    if not critical_path:
+        _check_api_key()
+    asyncio.run(_record_async(url, append_to, critical_path, save_to, path_name))
 
 
-async def _record_async(url: str, append_to: str | None) -> None:
+async def _record_async(
+    url: str,
+    append_to: str | None,
+    critical_path: bool = False,
+    save_to: str | None = None,
+    path_name: str | None = None,
+) -> None:
     from .recorder import generate_story, record_session
 
-    events = await record_session(url)
+    events = await record_session(url, critical_path=critical_path)
     if len(events) <= 1:
         console.print("[yellow]No interactions recorded.[/yellow]")
         return
 
-    console.print("[dim]Generating story from recorded interactions...[/dim]")
-    story = await generate_story(events)
+    if critical_path:
+        from .critical_path import CriticalPathFile, save_critical_paths
+        from .recorder import events_to_critical_path
 
-    console.print(f"\n[bold]Generated story:[/bold]\n  {story}\n")
+        name = path_name or f"recorded_{datetime.now(UTC).strftime('%H%M%S')}"
+        cp = events_to_critical_path(events, name=name)
 
-    if append_to:
-        with open(append_to, "a") as f:
-            f.write(f"\n  - name: recorded_{datetime.now(UTC).strftime('%H%M%S')}\n")
-            f.write("    path: /\n")
-            f.write(f'    story: "{story}"\n')
-        console.print(f"[green]Appended to {append_to}[/green]")
+        console.print(f"\n[bold]Recorded critical path:[/bold] {cp.name}")
+        console.print(f"  [dim]{len(cp.steps)} steps[/dim]\n")
+        for i, step in enumerate(cp.steps, 1):
+            loc_info = ""
+            if step.locator:
+                loc_info = f' {step.locator.role}("{step.locator.name}")'
+            elif step.url:
+                loc_info = f" {step.url}"
+            elif step.key:
+                loc_info = f" {step.key}"
+            console.print(f"  {i}. [bold]{step.action}[/bold]{loc_info}")
+
+        dest = save_to or f"probes/{name}.yml"
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        cpf = CriticalPathFile(base_url=base_url, name=name, paths=[cp])
+        save_critical_paths(cpf, dest)
+        console.print(f"\n[green]Saved to {dest}[/green]")
     else:
-        click.echo(story)
+        console.print("[dim]Generating story from recorded interactions...[/dim]")
+        story = await generate_story(events)
+
+        console.print(f"\n[bold]Generated story:[/bold]\n  {story}\n")
+
+        if append_to:
+            with open(append_to, "a") as f:
+                f.write(f"\n  - name: recorded_{datetime.now(UTC).strftime('%H%M%S')}\n")
+                f.write("    path: /\n")
+                f.write(f'    story: "{story}"\n')
+            console.print(f"[green]Appended to {append_to}[/green]")
+        else:
+            click.echo(story)
+
+
+# --- replay command ---
+
+
+@main.command("replay")
+@click.argument("path_file", type=click.Path(exists=True))
+@click.option("--auth", default=None, help="Path to storage state for authentication")
+@click.option("--headed", is_flag=True, default=False, help="Run browser in headed mode")
+@click.option(
+    "--runs-dir", default=RUNS_DIR, show_default=True, help="Directory to save run artifacts"
+)
+@click.option("--verify", is_flag=True, default=False, help="Run LLM verifier on final state")
+@click.option("--json-output", "json_out", is_flag=True, default=False, help="Output results as JSON")
+def replay_cmd(
+    path_file: str,
+    auth: str | None,
+    headed: bool,
+    runs_dir: str,
+    verify: bool,
+    json_out: bool,
+) -> None:
+    """Replay critical paths deterministically from a YAML file."""
+    if verify:
+        _check_api_key()
+    asyncio.run(_replay_async(path_file, auth, not headed, runs_dir, verify, json_out))
+
+
+async def _replay_async(
+    path_file: str,
+    auth: str | None,
+    headless: bool,
+    runs_dir: str,
+    verify: bool = False,
+    json_out: bool = False,
+) -> None:
+    from .critical_path import load_critical_paths
+    from .replay import replay_all
+
+    cpf = load_critical_paths(path_file)
+
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = Path(runs_dir) / f"replay-{run_id}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print(
+        Panel(
+            f"[bold]File:[/bold] {path_file}\n"
+            f"[bold]Base URL:[/bold] {cpf.base_url}\n"
+            f"[bold]Paths:[/bold] {len(cpf.paths)}",
+            title="[blue]QAProbe Replay[/blue]",
+        )
+    )
+
+    results = await replay_all(
+        cpf,
+        headless=headless,
+        storage_state=auth,
+        runs_dir=str(run_dir),
+    )
+
+    if verify:
+        await _verify_replay_results(results, cpf)
+
+    if json_out:
+        output = []
+        for r in results:
+            output.append({
+                "name": r.path_name,
+                "passed": r.passed,
+                "duration_ms": round(r.total_duration_ms, 1),
+                "steps": r.step_dicts,
+                "error": r.error,
+                "final_url": r.final_url,
+            })
+        click.echo(json.dumps(output, indent=2))
+        if any(not r.passed for r in results):
+            sys.exit(1)
+        return
+
+    console.print()
+    any_fail = False
+    for r in results:
+        color = "green" if r.passed else "red"
+        status = "PASS" if r.passed else "FAIL"
+        console.print(f"  [{color}]●[/{color}] [bold]{r.path_name}[/bold]: {status}")
+        console.print(
+            f"    [dim]{len(r.steps)} steps in {r.total_duration_ms:.0f}ms[/dim]"
+        )
+        if not r.passed:
+            any_fail = True
+            console.print(f"    [red]{r.error}[/red]")
+
+    passed = sum(1 for r in results if r.passed)
+    failed = len(results) - passed
+    console.print(
+        Panel(
+            f"[green]{passed} passed[/green]  [red]{failed} failed[/red]  "
+            f"[dim]({sum(r.total_duration_ms for r in results):.0f}ms total)[/dim]",
+            title="[blue]Replay Summary[/blue]",
+        )
+    )
+
+    if any_fail:
+        sys.exit(1)
+
+
+async def _verify_replay_results(results: list, cpf: object) -> None:
+    """Run the LLM verifier on successful replay results that have a verify clause."""
+    path_by_name = {p.name: p for p in cpf.paths}  # type: ignore[attr-defined]
+
+    for r in results:
+        if not r.passed:
+            continue
+        path_def = path_by_name.get(r.path_name)
+        if not path_def or not path_def.verify:
+            continue
+
+        console.print(f"  [dim]Verifying {r.path_name}...[/dim]")
+        try:
+            passed = await _run_replay_verifier(
+                path_def.verify, r.screenshot_b64, r.final_url, r.step_dicts
+            )
+            if not passed:
+                r.passed = False
+                r.error = f"LLM verifier rejected: {path_def.verify}"
+        except Exception as e:
+            console.print(f"  [yellow]Verifier error for {r.path_name}: {e}[/yellow]")
+
+
+async def _run_replay_verifier(
+    verify_text: str,
+    screenshot_b64: str,
+    final_url: str,
+    steps: list[dict],
+) -> bool:
+    """Lightweight verifier for critical path replay — asks the LLM one yes/no question."""
+    from .config import VERIFIER_MODEL
+    from .provider import get_provider
+
+    llm = get_provider()
+
+    step_summary = "\n".join(
+        f"  {s['step_num']}. {s['action']} {s.get('detail', '')}" for s in steps
+    )
+
+    prompt = (
+        f"A critical path replay just completed successfully.\n\n"
+        f"Final URL: {final_url}\n"
+        f"Steps executed:\n{step_summary}\n\n"
+        f"Verification condition: {verify_text}\n\n"
+        f"Based on the screenshot of the final page state, "
+        f"does the verification condition appear to be met?\n\n"
+        f'Respond with JSON: {{"passed": true/false, "reasoning": "..."}}'
+    )
+
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    if screenshot_b64:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": screenshot_b64,
+            },
+        })
+
+    response = await llm.chat(
+        model=VERIFIER_MODEL,
+        system="You are a QA verifier. Judge whether a verification condition is met based on evidence.",
+        messages=[{"role": "user", "content": content}],
+        max_tokens=512,
+    )
+
+    import re
+    match = re.search(r"\{[^{}]*\}", response.text, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            return bool(data.get("passed", False))
+        except json.JSONDecodeError:
+            pass
+    return False
+
+
+# --- watch command ---
+
+
+@main.command("watch")
+@click.argument("path_file", type=click.Path(exists=True))
+@click.option(
+    "--interval", default="5m",
+    help="Interval between runs (e.g. 30s, 5m, 1h). Default: 5m",
+)
+@click.option("--auth", default=None, help="Path to storage state for authentication")
+@click.option("--verify", is_flag=True, default=False, help="Run LLM verifier on final state")
+@click.option("--webhook", default=None, help="URL to POST failure notifications to")
+@click.option(
+    "--runs-dir", default=RUNS_DIR, show_default=True, help="Directory to save run artifacts"
+)
+@click.option("--max-runs", default=0, type=int, help="Stop after N runs (0 = unlimited)")
+def watch_cmd(
+    path_file: str,
+    interval: str,
+    auth: str | None,
+    verify: bool,
+    webhook: str | None,
+    runs_dir: str,
+    max_runs: int,
+) -> None:
+    """Watch critical paths on a schedule, alerting on failures."""
+    if verify:
+        _check_api_key()
+    seconds = _parse_interval(interval)
+    asyncio.run(
+        _watch_async(path_file, seconds, auth, verify, webhook, runs_dir, max_runs)
+    )
+
+
+def _parse_interval(interval: str) -> int:
+    """Parse a human interval string like '30s', '5m', '1h' into seconds."""
+    interval = interval.strip().lower()
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 3600
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60
+    if interval.endswith("s"):
+        return int(interval[:-1])
+    return int(interval)
+
+
+async def _watch_async(
+    path_file: str,
+    interval_seconds: int,
+    auth: str | None,
+    verify: bool,
+    webhook: str | None,
+    runs_dir: str,
+    max_runs: int,
+) -> None:
+    from .critical_path import load_critical_paths
+    from .replay import replay_all
+
+    cpf = load_critical_paths(path_file)
+
+    console.print(
+        Panel(
+            f"[bold]File:[/bold] {path_file}\n"
+            f"[bold]Base URL:[/bold] {cpf.base_url}\n"
+            f"[bold]Paths:[/bold] {len(cpf.paths)}\n"
+            f"[bold]Interval:[/bold] {interval_seconds}s",
+            title="[blue]QAProbe Watch[/blue]",
+        )
+    )
+
+    run_count = 0
+    consecutive_failures = 0
+
+    while True:
+        run_count += 1
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        run_dir = Path(runs_dir) / f"watch-{ts}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        console.print(f"\n[dim]── Run #{run_count} at {ts} ──[/dim]")
+
+        try:
+            results = await replay_all(
+                cpf, headless=True, storage_state=auth, runs_dir=str(run_dir),
+            )
+
+            if verify:
+                await _verify_replay_results(results, cpf)
+
+            failed = [r for r in results if not r.passed]
+
+            for r in results:
+                color = "green" if r.passed else "red"
+                status = "PASS" if r.passed else "FAIL"
+                line = f"  [{color}]●[/{color}] {r.path_name}: {status} ({r.total_duration_ms:.0f}ms)"
+                if not r.passed:
+                    line += f" — {r.error}"
+                console.print(line)
+
+            if failed:
+                consecutive_failures += 1
+                console.print(
+                    f"  [red bold]{len(failed)}/{len(results)} paths failed "
+                    f"(streak: {consecutive_failures})[/red bold]"
+                )
+                if webhook:
+                    await _send_webhook(webhook, cpf.name, ts, failed)
+            else:
+                if consecutive_failures > 0:
+                    console.print("  [green]All paths recovered.[/green]")
+                consecutive_failures = 0
+
+        except Exception as e:
+            console.print(f"  [red]Watch run error: {e}[/red]")
+            consecutive_failures += 1
+
+        if max_runs and run_count >= max_runs:
+            console.print(f"\n[dim]Reached max-runs ({max_runs}), stopping.[/dim]")
+            break
+
+        console.print(f"  [dim]Next run in {interval_seconds}s...[/dim]")
+        await asyncio.sleep(interval_seconds)
+
+
+async def _send_webhook(webhook_url: str, suite_name: str, timestamp: str, failed: list) -> None:
+    """POST a failure notification to a webhook URL."""
+    import urllib.request
+
+    payload = json.dumps({
+        "event": "critical_path_failure",
+        "suite": suite_name,
+        "timestamp": timestamp,
+        "failures": [
+            {"name": r.path_name, "error": r.error, "duration_ms": round(r.total_duration_ms, 1)}
+            for r in failed
+        ],
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+        console.print(f"  [dim]Webhook sent to {webhook_url}[/dim]")
+    except Exception as e:
+        console.print(f"  [yellow]Webhook failed: {e}[/yellow]")
 
 
 # --- install command ---

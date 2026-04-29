@@ -1,0 +1,51 @@
+# QAProbe critical path example — deterministic replay against TodoMVC
+name: todomvc-critical-paths
+base_url: https://todomvc.com/examples/react/dist
+
+critical_paths:
+  - name: add_and_complete_todo
+    description: Add a todo item and mark it complete
+    steps:
+      - action: navigate
+        url: /
+      - action: fill
+        locator:
+          role: textbox
+          name: What needs to be done?
+        value: Buy groceries
+      - action: press_key
+        key: Enter
+      - action: click
+        locator:
+          role: checkbox
+          name: Buy groceries
+    verify: "The todo item 'Buy groceries' is visible and marked as completed"
+
+  - name: add_multiple_and_filter
+    description: Add two todos, complete one, and filter
+    steps:
+      - action: navigate
+        url: /
+      - action: fill
+        locator:
+          role: textbox
+          name: What needs to be done?
+        value: First task
+      - action: press_key
+        key: Enter
+      - action: fill
+        locator:
+          role: textbox
+          name: What needs to be done?
+        value: Second task
+      - action: press_key
+        key: Enter
+      - action: click
+        locator:
+          role: checkbox
+          name: First task
+      - action: click
+        locator:
+          role: link
+          name: Completed
+    verify: "Only 'First task' is visible in the filtered list"
