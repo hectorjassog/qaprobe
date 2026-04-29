@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from playwright.async_api import Page
 
-from .browser import BrowserSession
+from .browser import BrowserSession, Snapshot
 from .critical_path import CriticalPath, CriticalPathFile, PathStep
+
+logger = logging.getLogger("qaprobe.replay")
+
+PROBE_TIMEOUT_MS = 2000
 
 
 @dataclass
@@ -21,6 +27,7 @@ class StepResult:
     passed: bool
     duration_ms: float
     error: str = ""
+    warning: str = ""
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -32,6 +39,8 @@ class StepResult:
         }
         if self.error:
             d["error"] = self.error
+        if self.warning:
+            d["warning"] = self.warning
         return d
 
 
@@ -70,23 +79,160 @@ def _step_detail(step: PathStep) -> str:
     return ""
 
 
-def _resolve_locator(page: Page, step: PathStep) -> Any:
-    """Build a Playwright locator from a PathStep's locator definition."""
+# ---------------------------------------------------------------------------
+# Edit distance for self-healing suggestions
+# ---------------------------------------------------------------------------
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance between two strings (case-insensitive)."""
+    a, b = a.lower(), b.lower()
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def suggest_closest(
+    snapshot: Snapshot,
+    role: str,
+    name: str,
+    max_suggestions: int = 3,
+) -> list[str]:
+    """Find the closest AX elements by role and name similarity."""
+    if not name:
+        return []
+
+    candidates: list[tuple[int, str]] = []
+    for el in snapshot.elements:
+        if not el.name:
+            continue
+        if el.role == role:
+            dist = _edit_distance(name, el.name)
+            label = f'{el.role}("{el.name}")'
+            candidates.append((dist, label))
+        elif el.name.lower() == name.lower():
+            label = f'{el.role}("{el.name}") [different role]'
+            candidates.append((0, label))
+
+    candidates.sort(key=lambda x: x[0])
+    seen: set[str] = set()
+    results: list[str] = []
+    for _, label in candidates:
+        if label not in seen:
+            seen.add(label)
+            results.append(label)
+        if len(results) >= max_suggestions:
+            break
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tiered locator resolution
+# ---------------------------------------------------------------------------
+
+async def _locator_visible(locator: Any, timeout_ms: int = PROBE_TIMEOUT_MS) -> bool:
+    """Check whether a Playwright locator finds at least one visible element."""
+    try:
+        await locator.first.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+async def _resolve_locator(
+    page: Page,
+    step: PathStep,
+    session: BrowserSession | None = None,
+) -> tuple[Any, str]:
+    """Tiered locator resolution. Returns (locator, warning_message).
+
+    Resolution order:
+      1. Exact role + name match
+      2. Fuzzy role + name match (exact=False)
+      3. data-testid fallback
+      4. CSS selector fallback
+    If all fail, take an AX snapshot and suggest closest matches.
+    """
     loc = step.locator
     if loc is None:
         raise ValueError(f"Step action '{step.action}' requires a locator")
 
+    warning = ""
+
+    # --- Tier 1: exact match ---
     if loc.name:
-        locator = page.get_by_role(loc.role, name=loc.name)  # type: ignore[arg-type]
-    else:
-        locator = page.get_by_role(loc.role)  # type: ignore[arg-type]
+        exact_loc = page.get_by_role(
+            loc.role, name=loc.name, exact=loc.exact,  # type: ignore[arg-type]
+        )
+        candidate = exact_loc.nth(loc.nth) if loc.nth else exact_loc.first
+        if await _locator_visible(candidate):
+            return candidate, warning
 
-    if loc.nth:
-        locator = locator.nth(loc.nth)
-    else:
-        locator = locator.first
+    elif loc.role:
+        role_loc = page.get_by_role(loc.role)  # type: ignore[arg-type]
+        candidate = role_loc.nth(loc.nth) if loc.nth else role_loc.first
+        if await _locator_visible(candidate):
+            return candidate, warning
 
-    return locator
+    # --- Tier 2: fuzzy match (only if tier 1 used exact=True and has a name) ---
+    if loc.name and loc.exact:
+        fuzzy_loc = page.get_by_role(
+            loc.role, name=loc.name, exact=False,  # type: ignore[arg-type]
+        )
+        candidate = fuzzy_loc.nth(loc.nth) if loc.nth else fuzzy_loc.first
+        if await _locator_visible(candidate):
+            warning = (
+                f"Fuzzy match used for {loc.role}(\"{loc.name}\") — "
+                f"exact match failed, substring/case-insensitive matched"
+            )
+            logger.warning(warning)
+            return candidate, warning
+
+    # --- Tier 3: test_id fallback ---
+    if loc.test_id:
+        tid_loc = page.get_by_test_id(loc.test_id).first
+        if await _locator_visible(tid_loc):
+            warning = (
+                f"Fallback to test_id=\"{loc.test_id}\" for "
+                f"{loc.role}(\"{loc.name}\") — role+name not found"
+            )
+            logger.warning(warning)
+            return tid_loc, warning
+
+    # --- Tier 4: CSS selector fallback ---
+    if loc.css:
+        css_loc = page.locator(loc.css).first
+        if await _locator_visible(css_loc):
+            warning = (
+                f"Fallback to css=\"{loc.css}\" for "
+                f"{loc.role}(\"{loc.name}\") — role+name and test_id not found"
+            )
+            logger.warning(warning)
+            return css_loc, warning
+
+    # --- All tiers failed: build a helpful error with suggestions ---
+    suggestions: list[str] = []
+    if session:
+        try:
+            snap = await session.snapshot()
+            suggestions = suggest_closest(snap, loc.role, loc.name)
+        except Exception:
+            pass
+
+    msg = f'{loc.role}("{loc.name}") not found on page'
+    if suggestions:
+        msg += "\n  Suggestions:\n"
+        for s in suggestions:
+            msg += f"    - {s}\n"
+    raise ValueError(msg)
 
 
 async def _execute_step(
@@ -94,8 +240,10 @@ async def _execute_step(
     session: BrowserSession,
     step: PathStep,
     base_url: str,
-) -> None:
-    """Execute a single critical-path step."""
+) -> str:
+    """Execute a single critical-path step. Returns a warning string (empty if none)."""
+    warning = ""
+
     if step.action == "navigate":
         url = step.url
         if url.startswith("/"):
@@ -104,17 +252,17 @@ async def _execute_step(
         await session.wait_for_stable()
 
     elif step.action == "click":
-        locator = _resolve_locator(page, step)
+        locator, warning = await _resolve_locator(page, step, session)
         await locator.click()
         await page.wait_for_load_state("domcontentloaded")
         await session.wait_for_stable()
 
     elif step.action == "fill":
-        locator = _resolve_locator(page, step)
+        locator, warning = await _resolve_locator(page, step, session)
         await locator.fill(step.value)
 
     elif step.action == "select":
-        locator = _resolve_locator(page, step)
+        locator, warning = await _resolve_locator(page, step, session)
         await locator.select_option(label=step.value)
         await session.wait_for_stable()
 
@@ -140,6 +288,8 @@ async def _execute_step(
     else:
         raise ValueError(f"Unknown action: {step.action!r}")
 
+    return warning
+
 
 async def replay_path(
     path: CriticalPath,
@@ -155,14 +305,17 @@ async def replay_path(
     overall_start = time.monotonic()
 
     try:
-        page = await session.start(video_dir or ".", storage_state=storage_state)
+        _fallback_dir = None
+        if not video_dir:
+            _fallback_dir = tempfile.mkdtemp(prefix="qaprobe-replay-")
+        page = await session.start(video_dir or _fallback_dir, storage_state=storage_state)
 
         for i, step in enumerate(path.steps, 1):
             step_start = time.monotonic()
             detail = _step_detail(step)
 
             try:
-                await _execute_step(page, session, step, base_url)
+                warning = await _execute_step(page, session, step, base_url)
                 elapsed = (time.monotonic() - step_start) * 1000
                 result.steps.append(StepResult(
                     step_num=i,
@@ -170,6 +323,7 @@ async def replay_path(
                     detail=detail,
                     passed=True,
                     duration_ms=elapsed,
+                    warning=warning,
                 ))
             except Exception as e:
                 elapsed = (time.monotonic() - step_start) * 1000

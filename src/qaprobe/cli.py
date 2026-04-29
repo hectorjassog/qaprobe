@@ -400,12 +400,14 @@ def a11y_cmd(url: str, output_html: bool, auth: str | None) -> None:
 
 
 async def _a11y_async(url: str, output_html: bool, auth: str | None) -> None:
+    import tempfile
+
     from .a11y import audit_snapshot
     from .browser import BrowserSession
 
     session = BrowserSession(headless=True)
     try:
-        page = await session.start(".", storage_state=auth)
+        page = await session.start(tempfile.mkdtemp(prefix="qaprobe-a11y-"), storage_state=auth)
         await page.goto(url, wait_until="domcontentloaded")
         await session.wait_for_stable()
         snap = await session.snapshot()
@@ -718,8 +720,12 @@ async def _run_replay_verifier(
     final_url: str,
     steps: list[dict],
 ) -> bool:
-    """Lightweight verifier for critical path replay — asks the LLM one yes/no question."""
-    from .config import VERIFIER_MODEL
+    """Lightweight verifier for critical path replay — asks the LLM one yes/no question.
+
+    Uses FAST_MODEL (Haiku) since this is a simple pass/fail judgment,
+    not the full agentic verification that warrants Opus.
+    """
+    from .config import FAST_MODEL
     from .provider import get_provider
 
     llm = get_provider()
@@ -750,10 +756,10 @@ async def _run_replay_verifier(
         })
 
     response = await llm.chat(
-        model=VERIFIER_MODEL,
+        model=FAST_MODEL,
         system="You are a QA verifier. Judge whether a verification condition is met based on evidence.",
         messages=[{"role": "user", "content": content}],
-        max_tokens=512,
+        max_tokens=256,
     )
 
     import re

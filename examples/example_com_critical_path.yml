@@ -1,0 +1,38 @@
+# QAProbe self-test — deterministic critical path against example.com
+#
+# This file serves two purposes:
+#   1. A simple example of the critical path format with fallback locators
+#   2. A CI smoke test: `qaprobe replay examples/example_com_critical_path.yml`
+#      validates the replay engine works end-to-end with zero LLM cost.
+#
+# example.com is IANA-maintained and extremely stable, making it ideal
+# for a self-test that should never flake.
+
+name: example-com-critical-paths
+base_url: https://example.com
+
+critical_paths:
+  - name: page_loads_with_heading
+    description: Verify the page loads and the main heading is present
+    steps:
+      - action: navigate
+        url: /
+      - action: click
+        locator:
+          role: heading
+          name: Example Domain
+    verify: "The heading 'Example Domain' is visible on the page"
+
+  - name: navigate_to_iana
+    description: Click the IANA link and verify navigation
+    steps:
+      - action: navigate
+        url: /
+      - action: click
+        locator:
+          role: link
+          name: More information...
+          css: "a[href]"
+      - action: wait
+        ms: 2000
+    verify: "The page has navigated away from example.com to an IANA page"

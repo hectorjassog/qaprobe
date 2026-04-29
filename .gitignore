@@ -224,3 +224,4 @@ __marimo__/
 runs/
 .qaprobe/
 .auth/
+*.webm

@@ -20,6 +20,8 @@ class RecordedEvent:
     url: str = ""
     role: str = ""
     name: str = ""
+    test_id: str = ""
+    css: str = ""
 
 
 STORY_GENERATION_PROMPT = """You are a QA engineer. Given a sequence of browser interactions, write a concise natural-language user story that describes what the user was trying to accomplish and what they should expect to see.
@@ -92,6 +94,21 @@ function __qaprobe_get_name(el) {
 
     const text = el.textContent?.trim().substring(0, 80);
     return text || el.tagName.toLowerCase();
+}
+
+function __qaprobe_get_test_id(el) {
+    const tid = el.getAttribute('data-testid');
+    if (tid) return tid;
+    const parent = el.closest('[data-testid]');
+    return parent ? parent.getAttribute('data-testid') : '';
+}
+
+function __qaprobe_get_css(el) {
+    const tag = el.tagName.toLowerCase();
+    if (el.id) return tag + '#' + el.id;
+    const classes = Array.from(el.classList).filter(c => !c.startsWith('_')).slice(0, 2);
+    if (classes.length) return tag + '.' + classes.join('.');
+    return '';
 }
 """
 
@@ -172,6 +189,8 @@ async def _setup_critical_path_listeners(page: Page, events: list[RecordedEvent]
             target=data.get("name", ""),
             role=data.get("role", ""),
             name=data.get("name", ""),
+            test_id=data.get("test_id", ""),
+            css=data.get("css", ""),
         ))
 
     async def on_fill(data_json: str) -> None:
@@ -182,6 +201,8 @@ async def _setup_critical_path_listeners(page: Page, events: list[RecordedEvent]
             value=data.get("value", ""),
             role=data.get("role", ""),
             name=data.get("name", ""),
+            test_id=data.get("test_id", ""),
+            css=data.get("css", ""),
         ))
 
     async def on_select(data_json: str) -> None:
@@ -192,6 +213,8 @@ async def _setup_critical_path_listeners(page: Page, events: list[RecordedEvent]
             value=data.get("value", ""),
             role=data.get("role", ""),
             name=data.get("name", ""),
+            test_id=data.get("test_id", ""),
+            css=data.get("css", ""),
         ))
 
     async def on_keypress(data_json: str) -> None:
@@ -214,7 +237,9 @@ async def _setup_critical_path_listeners(page: Page, events: list[RecordedEvent]
             const role = __qaprobe_infer_role(el);
             if (!role) return;
             const name = __qaprobe_get_name(el);
-            window.__qaprobe_cp_click(JSON.stringify({role, name}));
+            const test_id = __qaprobe_get_test_id(el);
+            const css = __qaprobe_get_css(el);
+            window.__qaprobe_cp_click(JSON.stringify({role, name, test_id, css}));
         }, true);
 
         document.addEventListener('change', (e) => {
@@ -222,14 +247,19 @@ async def _setup_critical_path_listeners(page: Page, events: list[RecordedEvent]
             const role = __qaprobe_infer_role(el);
             if (!role) return;
             const name = __qaprobe_get_name(el);
+            const test_id = __qaprobe_get_test_id(el);
+            const css = __qaprobe_get_css(el);
 
             if (el.tagName.toLowerCase() === 'select') {
                 const selected = el.options[el.selectedIndex];
                 window.__qaprobe_cp_select(JSON.stringify({
-                    role, name, value: selected ? selected.text : el.value
+                    role, name, test_id, css,
+                    value: selected ? selected.text : el.value
                 }));
             } else {
-                window.__qaprobe_cp_fill(JSON.stringify({role, name, value: el.value || ''}));
+                window.__qaprobe_cp_fill(JSON.stringify({
+                    role, name, test_id, css, value: el.value || ''
+                }));
             }
         }, true);
 
@@ -254,18 +284,27 @@ def events_to_critical_path(
         elif ev.action == "click" and ev.role:
             steps.append(PathStep(
                 action="click",
-                locator=Locator(role=ev.role, name=ev.name),
+                locator=Locator(
+                    role=ev.role, name=ev.name,
+                    test_id=ev.test_id, css=ev.css,
+                ),
             ))
         elif ev.action == "fill" and ev.role:
             steps.append(PathStep(
                 action="fill",
-                locator=Locator(role=ev.role, name=ev.name),
+                locator=Locator(
+                    role=ev.role, name=ev.name,
+                    test_id=ev.test_id, css=ev.css,
+                ),
                 value=ev.value,
             ))
         elif ev.action == "select" and ev.role:
             steps.append(PathStep(
                 action="select",
-                locator=Locator(role=ev.role, name=ev.name),
+                locator=Locator(
+                    role=ev.role, name=ev.name,
+                    test_id=ev.test_id, css=ev.css,
+                ),
                 value=ev.value,
             ))
         elif ev.action == "press_key":

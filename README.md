@@ -92,6 +92,39 @@ qaprobe record --url http://localhost:3000
 
 # Append to an existing suite
 qaprobe record --url http://localhost:3000 --append-to probes/myapp.yml
+
+# Record as a deterministic critical path (no LLM needed)
+qaprobe record --url http://localhost:3000 --critical-path --name checkout_flow
+```
+
+### Critical path replay
+
+Replay recorded paths deterministically — no LLM cost, fast, reliable:
+
+```bash
+# Replay all paths in a file
+qaprobe replay probes/critical_paths.yml
+
+# With optional LLM verification of the final state (uses Haiku, very cheap)
+qaprobe replay probes/critical_paths.yml --verify
+
+# JSON output for CI integration
+qaprobe replay probes/critical_paths.yml --json-output
+```
+
+### Continuous monitoring
+
+Watch critical paths on a schedule and alert on failures:
+
+```bash
+# Check every 5 minutes
+qaprobe watch probes/critical_paths.yml --interval 5m
+
+# With webhook notifications on failure
+qaprobe watch probes/critical_paths.yml --interval 1h --webhook https://hooks.slack.com/...
+
+# Stop after 10 runs
+qaprobe watch probes/critical_paths.yml --interval 30s --max-runs 10
 ```
 
 ### Scaffold a new project
@@ -203,8 +236,29 @@ qaprobe login
   --url              Login page URL (required)
   --save             Path to save state (default: .auth/state.json)
 
+qaprobe record
+  --url              URL to start recording from (required)
+  --append-to        Append generated story to a suite YAML
+  --critical-path    Record as a deterministic critical path
+  --save-to          Save critical path to a specific YAML file
+  --name             Name for the critical path
+
+qaprobe replay <file>
+  --auth             Path to storage state JSON
+  --headed           Show the browser window
+  --runs-dir         Artifact directory
+  --verify           Run LLM verifier on final state (uses Haiku)
+  --json-output      Output results as JSON
+
+qaprobe watch <file>
+  --interval         Interval between runs (e.g. 30s, 5m, 1h)
+  --auth             Path to storage state JSON
+  --verify           Run LLM verifier on final state
+  --webhook          URL to POST failure notifications to
+  --runs-dir         Artifact directory
+  --max-runs         Stop after N runs (0 = unlimited)
+
 qaprobe init           Scaffold probes/ directory
-qaprobe record         Record interactions and generate a story
 qaprobe install        Install Playwright Chromium
 ```
 
@@ -257,6 +311,8 @@ See the [`examples/`](examples/) directory for suite files you can run immediate
 - [`example_com.yml`](examples/example_com.yml) — basic tests against example.com
 - [`todomvc.yml`](examples/todomvc.yml) — tests against a public TodoMVC React app
 - [`hackernews.yml`](examples/hackernews.yml) — tests against Hacker News
+- [`example_com_critical_path.yml`](examples/example_com_critical_path.yml) — deterministic critical path (no LLM needed)
+- [`todomvc_critical_path.yml`](examples/todomvc_critical_path.yml) — critical path with verification clauses
 
 ## License
 

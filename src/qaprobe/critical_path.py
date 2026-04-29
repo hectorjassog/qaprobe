@@ -13,6 +13,9 @@ class Locator:
     role: str
     name: str = ""
     nth: int = 0
+    test_id: str = ""
+    css: str = ""
+    exact: bool = True
 
     def to_dict(self) -> dict:
         d: dict = {"role": self.role}
@@ -20,6 +23,12 @@ class Locator:
             d["name"] = self.name
         if self.nth:
             d["nth"] = self.nth
+        if self.test_id:
+            d["test_id"] = self.test_id
+        if self.css:
+            d["css"] = self.css
+        if not self.exact:
+            d["exact"] = False
         return d
 
     @classmethod
@@ -28,6 +37,9 @@ class Locator:
             role=data["role"],
             name=data.get("name", ""),
             nth=data.get("nth", 0),
+            test_id=data.get("test_id", ""),
+            css=data.get("css", ""),
+            exact=data.get("exact", True),
         )
 
 
